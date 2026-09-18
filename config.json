@@ -1,0 +1,57 @@
+{
+  "advocates": {
+    "A Mahesh Chowdhary": [
+      "A Mahesh Chowdhary",
+      "Mahesh Chowdhary",
+      "Mahesh Choudhary",
+      "Mahesh Chaudhary",
+      "Mahesh Chowdhry",
+      "Mahesh Chaudhury",
+      "A. Mahesh Chowdhary",
+      "M. Chowdhary",
+      "Chowdhary A. Mahesh"
+    ],
+    "A Nagaraja Naidu": [
+      "A Nagaraja Naidu",
+      "Nagaraja Naidu",
+      "Nagaraj Naidu",
+      "Nagarajan Naidu",
+      "Nagraj Naidu",
+      "A. Nagaraja Naidu",
+      "Naidu A. Nagaraja"
+    ],
+    "Abhimanyu": [
+      "Abhimanyu",
+      "Abhimanya",
+      "Abhimanu",
+      "Abimanyu"
+    ],
+    "Krishika Vaishnav": [
+      "Krishika Vaishnav",
+      "Krushika Vaishnav",
+      "Krishika Vaishnaw",
+      "Krishika Vaishnava",
+      "K. Vaishnav"
+    ],
+    "Shahbaaz Hussain": [
+      "Shahbaaz Hussain",
+      "Shahbaz Husain",
+      "Shahbaaz Hussain",
+      "Shahbaz Hussain",
+      "Shahbaaz Husain"
+    ]
+  },
+  "query_seeds": [
+    "A Mahesh Chowdhary",
+    "Mahesh Choudhary",
+    "Mahesh Chaudhary",
+    "A Nagaraja Naidu",
+    "Nagaraj Naidu",
+    "Abhimanyu",
+    "Abhimanya",
+    "Krishika Vaishnav",
+    "Krushika Vaishnav",
+    "Shahbaaz Hussain",
+    "Shahbaz Husain"
+  ]
+}
