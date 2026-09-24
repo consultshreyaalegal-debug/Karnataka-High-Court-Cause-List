@@ -3,7 +3,7 @@ name: Karnataka HC Cause List Monitor
 on:
   schedule:
     - cron: "0 18-22 * * *"
-  timezone: "Asia/Kolkata"
+      timezone: "Asia/Kolkata"
   workflow_dispatch:
 
 permissions:
