@@ -27,17 +27,19 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies
+      - name: Install and verify Python dependencies
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Verify Python environment
-        run: |
+          set -e
           python --version
-          python -c "import sys; print(sys.executable)"
           python -m pip --version
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir -r requirements.txt
           python -c "import playwright, pandas, bs4, rapidfuzz; print('Required Python packages: OK')"
+          python -m pip show playwright
+          python -m pip show pandas
+          python -m pip show beautifulsoup4
+          python -m pip show rapidfuzz
 
       - name: Install Chromium and browser dependencies
         run: python -m playwright install --with-deps chromium
