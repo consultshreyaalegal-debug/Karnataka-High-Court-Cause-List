@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sys
+import time
+from io import StringIO
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,8 +21,13 @@ CONFIG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
 ADVOCATE_GROUPS: dict[str, list[str]] = CONFIG["advocates"]
 QUERY_SEEDS: list[str] = CONFIG.get("query_seeds") or [v[0] for v in ADVOCATE_GROUPS.values()]
 BENCHES = ["Bengaluru Bench", "Dharwad Bench", "Kalaburagi Bench"]
+BENCH_VALUES = {
+    "Bengaluru Bench": "B",
+    "Dharwad Bench": "D",
+    "Kalaburagi Bench": "K",
+}
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "7"))
-FUZZY_CONFIRM = int(os.getenv("FUZZY_CONFIRM", "88"))
+FUZZY_CONFIRM = int(os.getenv("FUZZY_CONFIRM", "95"))
 FUZZY_UNCERTAIN = int(os.getenv("FUZZY_UNCERTAIN", "74"))
 
 HEADINGS = {
@@ -134,6 +141,36 @@ def set_date_input(inp, dt: date):
     inp.fill(val)
 
 
+def goto_with_retries(page, url: str, attempts: int = 3):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            if response is None or response.status >= 500:
+                status = response.status if response else "no response"
+                raise RuntimeError(f"Court page returned HTTP {status}")
+            if response.status >= 400:
+                raise RuntimeError(f"Court page returned HTTP {response.status}")
+            return response
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                page.wait_for_timeout(1000 * (attempt + 1))
+    raise RuntimeError(f"Court page failed after {attempts} attempts: {last_error}") from last_error
+
+
+def run_search_with_retries(search, *args, attempts: int = 2):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return search(*args)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(1)
+    raise RuntimeError(f"Court search failed after {attempts} attempts: {last_error}") from last_error
+
+
 def click_get_details(page):
     candidates = [
         page.get_by_role("button", name=re.compile(r"GET DETAILS|GET LIST", re.I)),
@@ -151,71 +188,209 @@ def click_get_details(page):
     raise RuntimeError("Could not find GET DETAILS / GET LIST button")
 
 
+def wait_for_result(page, label: str) -> None:
+    deadline = time.monotonic() + 60
+    result = page.locator("#listDisp")
+    result.wait_for(state="visible", timeout=60000)
+    while time.monotonic() < deadline:
+        if result.inner_text().strip():
+            return
+        page.wait_for_timeout(250)
+    raise RuntimeError(f"Court {label} returned no result within 60 seconds")
+
+
 def run_advocate_search(page, bench: str, advocate_query: str, start: date, end: date) -> str:
-    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(700)
+    goto_with_retries(page, BASE_URL)
 
-    bench_select = choose_select(page, lambda x: "bengaluru" in x.lower() or "dharwad" in x.lower() or "kalaburagi" in x.lower() or "kalburagi" in x.lower())
-    # Match court spelling used by the live select.
-    target = "kalburagi bench" if "kalaburagi" in bench.lower() else bench.lower()
-    options = bench_select.locator("option").all_text_contents()
-    chosen = next((o for o in options if target in o.lower()), None)
-    if chosen is None:
-        chosen = next((o for o in options if bench.lower().split()[0] in o.lower()), None)
-    if chosen is None:
-        raise RuntimeError(f"Bench option not found: {bench}; options={options}")
-    bench_select.select_option(label=chosen)
+    advocate_tab = page.locator('a[data-toggle="tab"][href="#tab-1-content"]')
+    if advocate_tab.count() != 1:
+        raise RuntimeError("Verified advocate-search tab is missing")
+    advocate_tab.click()
+    form = page.locator('form:has(select[name="adv_bench"])')
+    bench_select = form.locator('select[name="adv_bench"]')
+    if bench_select.count() != 1:
+        raise RuntimeError("Verified advocate-search bench selector is missing")
+    bench_select.select_option(BENCH_VALUES[bench])
+    form.locator('input[name="advName"]').wait_for(state="visible", timeout=30000)
+    form.locator('input[name="advName"]').fill(advocate_query)
+    form.locator('input[name="afromDt"]').fill(start.strftime("%d/%m/%Y"))
+    form.locator('input[name="Regno"]').fill("")
 
-    search_by = choose_select(page, lambda x: x.strip().lower() == "advocate" or "advocate" == x.strip().lower())
-    search_by.select_option(label=next(o for o in search_by.locator("option").all_text_contents() if o.strip().lower() == "advocate"))
+    result = form.locator('input[name="getData"][value="GET LIST"]')
+    if result.count() != 1:
+        raise RuntimeError("Verified advocate-search GET LIST control is missing")
+    with page.expect_response(
+        lambda response: "causeListSearchAdvocateResp.php" in response.url,
+        timeout=60000,
+    ) as result_response:
+        result.click()
+    response = result_response.value
+    if response.status >= 400:
+        raise RuntimeError(f"Court advocate search returned HTTP {response.status}")
+    wait_for_result(page, "advocate search")
+    return page.content()
 
-    # The page can dynamically reveal the advocate field after selecting Advocate.
-    page.wait_for_timeout(400)
-    adv = choose_input(page, ["advocate"])
-    if adv is None:
-        raise RuntimeError("Advocate name input was not found")
-    adv.fill(advocate_query)
 
-    date_inputs = []
-    for inp in page.locator("input").all():
-        try:
-            typ = (inp.get_attribute("type") or "text").lower()
-            blob = " ".join([inp.get_attribute("name") or "", inp.get_attribute("id") or "", inp.get_attribute("placeholder") or ""]).lower()
-            if typ == "date" or "dd/mm/yyyy" in blob or "date" in blob:
-                if inp.is_visible():
-                    date_inputs.append(inp)
-        except Exception:
-            pass
-    # Deduplicate by DOM identity is awkward; just keep the first two usable inputs.
-    if len(date_inputs) < 2:
-        # Fall back to visible text inputs that look like date controls from nearby placeholders.
-        for inp in page.locator('input[type="text"]').all():
-            try:
-                if inp.is_visible() and inp not in date_inputs:
-                    ph = (inp.get_attribute("placeholder") or "").lower()
-                    if "dd/mm/yyyy" in ph:
-                        date_inputs.append(inp)
-            except Exception:
-                pass
-    if len(date_inputs) < 2:
-        raise RuntimeError("Could not locate both cause-list date fields")
-
-    set_date_input(date_inputs[0], start)
-    set_date_input(date_inputs[1], end)
-
-    click_get_details(page)
-    try:
-        page.wait_for_load_state("networkidle", timeout=45000)
-    except PlaywrightTimeoutError:
-        page.wait_for_timeout(2500)
+def run_general_advocate_search(page, bench: str, advocate_query: str, start: date, end: date) -> str:
+    """Fetch the Court's full cause-list blocks for authoritative list headings."""
+    goto_with_retries(page, BASE_URL)
+    advocate_tab = page.locator('a[data-toggle="tab"][href="#tab-0-content"]')
+    if advocate_tab.count() != 1:
+        raise RuntimeError("Verified general-search tab is missing")
+    advocate_tab.click()
+    form = page.locator('form:has(select[name="bench"])')
+    form.locator('select[name="bench"]').select_option(BENCH_VALUES[bench])
+    form.locator('select[name="searchby"]').select_option("3")
+    form.locator('input[name="advName"]').wait_for(state="visible", timeout=30000)
+    form.locator('input[name="advName"]').fill(advocate_query)
+    form.locator('input[name="fromDt"]').fill(start.strftime("%d/%m/%Y"))
+    form.locator('input[name="toDt"]').fill(end.strftime("%d/%m/%Y"))
+    button = form.locator('input[name="getData"][value="GET DETAILS"]')
+    if button.count() != 1:
+        raise RuntimeError("Verified general-search GET DETAILS control is missing")
+    with page.expect_response(
+        lambda response: "causeListSearchResp.php" in response.url,
+        timeout=60000,
+    ) as result_response:
+        button.click()
+    response = result_response.value
+    if response.status >= 400:
+        raise RuntimeError(f"Court general search returned HTTP {response.status}")
+    wait_for_result(page, "general search")
     return page.content()
 
 
 def tables_from_html(html: str) -> list[pd.DataFrame]:
-    try:
-        return pd.read_html(html)
-    except ValueError:
+    from bs4 import BeautifulSoup
+
+    def extract_case_number(value: str) -> str:
+        match = re.search(
+            r"\b(?:WP|RFA|RP|RSA|CRL\.?P|W\.A|MFA|COMAP|CCC|CP|W\.P)\s*[A-Z0-9./-]*\d+[A-Z0-9./-]*\b",
+            value,
+            re.I,
+        )
+        return match.group(0).strip() if match else ""
+
+    soup = BeautifulSoup(html, "lxml")
+    result = soup.select_one("#listDisp")
+    if result is None:
         return []
+
+    tables: list[pd.DataFrame] = []
+    for table in result.select("table"):
+        rows: list[list[str]] = []
+        all_rows = table.select("tr")
+        if not all_rows:
+            continue
+
+        header_map: dict[str, int] = {}
+        for row_index, row in enumerate(all_rows):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if not cells:
+                continue
+            values = [cell.get_text(" ", strip=True) for cell in cells]
+            if not values:
+                continue
+            text_blob = " ".join(norm(v) for v in values if v)
+            if any(token in text_blob for token in ("case number", "case no", "advocate", "petitioner", "respondent", "session", "item", "serial")):
+                for col_index, value in enumerate(values):
+                    lb = norm(value)
+                    if "case no" in lb or "case number" in lb:
+                        header_map["case_number"] = col_index
+                    elif "case type" in lb:
+                        header_map["case_type"] = col_index
+                    elif "petitioner" in lb or "respondent" in lb or "parties" in lb or "cause title" in lb:
+                        header_map["party"] = col_index
+                    elif "advocate" in lb or "counsel" in lb or "party in person" in lb:
+                        header_map["advocate"] = col_index
+                    elif "session" in lb or "list type" in lb or "hearing" in lb:
+                        header_map["session"] = col_index
+                    elif "item" in lb or "sl no" in lb or "serial" in lb:
+                        header_map["item"] = col_index
+                if header_map:
+                    for data_row in all_rows[row_index + 1 :]:
+                        data_cells = data_row.find_all(["th", "td"], recursive=False)
+                        if not data_cells:
+                            continue
+                        data_values = [cell.get_text(" ", strip=True) for cell in data_cells]
+                        if len(data_values) <= max(header_map.values(), default=-1):
+                            continue
+                        case_number = data_values[header_map.get("case_number", -1)] if "case_number" in header_map else ""
+                        if not case_number:
+                            case_number = next((v for v in data_values if extract_case_number(v)), "")
+                        if not extract_case_number(case_number):
+                            continue
+
+                        party_text = data_values[header_map["party"]] if "party" in header_map and header_map["party"] < len(data_values) else ""
+                        session_text = data_values[header_map["session"]] if "session" in header_map and header_map["session"] < len(data_values) else ""
+                        item_value = data_values[header_map["item"]] if "item" in header_map and header_map["item"] < len(data_values) else ""
+
+                        advocate_cell = data_cells[header_map["advocate"]] if "advocate" in header_map and header_map["advocate"] < len(data_cells) else None
+                        if advocate_cell is not None:
+                            italic_text = " ".join(node.get_text(" ", strip=True) for node in advocate_cell.find_all("i"))
+                            for italic in advocate_cell.find_all("i"):
+                                italic.extract()
+                            advocate_text = advocate_cell.get_text(" ", strip=True)
+                            if italic_text and not advocate_text:
+                                advocate_text = italic_text
+                        else:
+                            advocate_text = ""
+
+                        rows.append([
+                            "",
+                            "",
+                            "",
+                            item_value,
+                            case_number,
+                            session_text,
+                            party_text,
+                            advocate_text,
+                        ])
+                    break
+
+        if rows:
+            tables.append(pd.DataFrame(rows, columns=[
+                "Date List", "Hall No.", "List No.", "Item", "Case Number", "Session Type",
+                "Petitioner/Respondent", "Advocate",
+            ]))
+            continue
+
+        for row in all_rows:
+            cells = row.find_all(["th", "td"], recursive=False)
+            values = [cell.get_text(" ", strip=True) for cell in cells]
+            if len(values) < 6:
+                continue
+            if len(values) >= 6 and norm(values[0]) == "date list" and "case no" in norm(values[4]):
+                continue
+            case_numbers = [extract_case_number(v) for v in values]
+            case_index = next((i for i, v in enumerate(case_numbers) if v), None)
+            if case_index is None:
+                continue
+            advocate_cell = cells[-1]
+            party_text = " ".join(node.get_text(" ", strip=True) for node in advocate_cell.find_all("i"))
+            for italic in advocate_cell.find_all("i"):
+                italic.extract()
+            advocate_text = advocate_cell.get_text(" ", strip=True)
+            if not advocate_text:
+                advocate_text = party_text
+
+            session_text = values[1] if len(values) > 1 else ""
+            rows.append([
+                values[0] if len(values) > 0 else "",
+                values[1] if len(values) > 1 else "",
+                values[2] if len(values) > 2 else "",
+                values[0] if len(values) > 0 else "",
+                values[case_index] if case_index < len(values) else "",
+                session_text,
+                values[4] if len(values) > 4 else "",
+                advocate_text,
+            ])
+        if rows:
+            tables.append(pd.DataFrame(rows, columns=[
+                "Date List", "Hall No.", "List No.", "Item", "Case Number", "Session Type",
+                "Petitioner/Respondent", "Advocate",
+            ]))
+    return tables
 
 
 def html_text(html: str) -> str:
@@ -225,6 +400,56 @@ def html_text(html: str) -> str:
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
     return "\n".join(x.strip() for x in soup.get_text("\n").splitlines() if x.strip())
+
+
+def general_list_metadata(html: str) -> dict[str, dict[str, str]]:
+    """Extract list headings from the Court's full cause-list blocks."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    metadata: dict[str, dict[str, str]] = {}
+    hall = list_no = judge = session = ""
+    for row in soup.select("#listDisp tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        text = clean_advocate_text(row.get_text(" ", strip=True))
+        if not text:
+            continue
+        hall_match = re.search(r"COURT HALL NO\s*:\s*(.*?)(?:\s+CAUSE LIST NO\b|$)", text, re.I)
+        if hall_match:
+            hall = hall_match.group(1).strip()
+            list_match = re.search(r"CAUSE LIST NO\.?\s*[:.]?\s*(\S+)", text, re.I)
+            list_no = list_match.group(1) if list_match else ""
+            session = ""
+            continue
+        if len(cells) == 1 and re.search(r"^(?:THE HON|HON'BLE|HON`BLE)", text, re.I):
+            judge = re.sub(r"^.*?\b(?:JUSTICE|JUDGE|REGISTRAR)\s+", "", text, flags=re.I).strip()
+            continue
+        if len(cells) == 1 and not re.search(
+            r"^(?:IN THE HIGH COURT|ON |PHYSICAL |AT |BEFORE|\(To get|\(For |JOIN VC|WEBSITE:|PUBLISHED|PRINTED)",
+            text,
+            re.I,
+        ):
+            if not re.search(r"^(?:Sl\.No\.?|Case No\.)", text, re.I):
+                session = text
+            continue
+        if len(cells) < 5 or not re.search(r"\b(?:WP|RFA|RP|CRL|W\.A|MFA|COMAP|CCC|CP)\b", text, re.I):
+            continue
+        case_text = clean_advocate_text(cells[1].get_text(" ", strip=True))
+        case_match = re.search(
+            r"\b(?:WP|RFA|RP|RSA|CRL\.?P|W\.A|MFA|COMAP|CCC|CP)\s*[A-Z0-9./-]*\d+[A-Z0-9./-]*",
+            case_text,
+            re.I,
+        )
+        case_number = case_match.group(0).strip() if case_match else ""
+        serial = clean_advocate_text(cells[0].get_text(" ", strip=True))
+        if case_number and serial:
+            metadata[case_number] = {
+                "serial": serial,
+                "session": session or (f"Cause List No. {list_no}" if list_no else ""),
+                "hall": hall,
+                "judge": judge,
+            }
+    return metadata
 
 
 BENCH_ALIASES = {
@@ -251,28 +476,33 @@ def read_bench_update_status(page) -> dict[str, dict[str, str]]:
     statuses: dict[str, dict[str, str]] = {}
 
     bench_pattern = re.compile(
-        r"^(Bengaluru|Bangalore|Dharwad|Kalaburagi|Kalburagi)\s*:\s*(.*)$", re.I
+        r"(Bengaluru|Bangalore|Dharwad|Kalaburagi|Kalburagi)\s*:\s*", re.I
     )
 
     for bench, aliases in BENCH_ALIASES.items():
         snippet = ""
         for i, line in enumerate(lines):
-            m = bench_pattern.match(line)
-            if not m:
-                continue
-            label = m.group(1).lower()
-            if not any(label == a.lower() for a in aliases):
-                continue
-            snippet = m.group(2).strip()
-            if not snippet and i + 1 < len(lines):
-                # Some renderings place the value on the following line.
-                nxt = lines[i + 1]
-                if not bench_pattern.match(nxt):
-                    snippet = nxt
-            break
+            matches = list(bench_pattern.finditer(line))
+            for match_index, m in enumerate(matches):
+                label = m.group(1).lower()
+                if not any(label == a.lower() for a in aliases):
+                    continue
+                end = matches[match_index + 1].start() if match_index + 1 < len(matches) else len(line)
+                snippet = line[m.end():end].strip()
+                if not snippet and i + 1 < len(lines):
+                    nxt = lines[i + 1]
+                    if not bench_pattern.search(nxt):
+                        snippet = nxt
+                break
+            if snippet:
+                break
 
         low = snippet.lower()
-        pending = "final cause list pending" in low
+        pending = (
+            "final cause list pending" in low
+            or "wait for final" in low
+            or "awaiting final" in low
+        )
         m = TIMESTAMP_RE.search(snippet)
         if pending:
             status = "TENTATIVE"
@@ -343,33 +573,50 @@ def clean_advocate_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip(" -|\n\t")
 
 
+def _column_index(columns, patterns: tuple[str, ...]) -> int | None:
+    for index, column in enumerate(columns):
+        label = norm(column)
+        if any(pattern in label for pattern in patterns):
+            return index
+    return None
+
+
 def row_records(df: pd.DataFrame, page_lines: list[str], bench: str, query: str) -> tuple[list[dict], list[dict]]:
     confirmed, uncertain = [], []
-    # Make string columns easy to inspect.
     df = df.fillna("").astype(str)
+    columns = [str(column) for column in df.columns]
+    advocate_columns = [
+        index for index, column in enumerate(columns)
+        if any(token in norm(column) for token in ("advocate", "counsel", "party in person"))
+    ]
+    if not advocate_columns:
+        return confirmed, uncertain
+    item_index = _column_index(columns, ("item", "serial", "sl no", "sr no"))
+    session_index = _column_index(columns, ("session", "list type", "hearing"))
+    case_number_index = _column_index(columns, ("case no", "case number"))
+    case_type_index = _column_index(columns, ("case type",))
+    party_index = _column_index(columns, ("petitioner", "respondent", "parties", "cause title"))
     for _, row in df.iterrows():
         vals = [clean_advocate_text(v) for v in row.tolist()]
         row_text = " | ".join(vals)
-        # Look through individual cells and the row as a whole, but prefer advocate-labelled cells.
-        candidates = vals + [row_text]
+        candidates = [vals[index] for index in advocate_columns]
         match = max((match_advocate(c) for c in candidates), key=lambda x: x[1])
         group, score, variant = match
         if not group or score < FUZZY_UNCERTAIN:
             continue
-        # Avoid false positives from the page's generic heading / navigation text.
-        if not any(re.search(r"\b(?:WP|RFA|RP|CRL\.?P|W\.A|MFA|COMAP|CCC|CP|W\.P)\b", v, re.I) for v in vals):
-            continue
-        case_number = ""
-        for v in vals:
-            m = re.search(r"\b(?:WP|RFA|RP|CRL\.?P|W\.A|MFA|COMAP|CCC|CP|W\.P)\s*[A-Z0-9./-]*\d+[A-Z0-9./-]*\b", v, re.I)
-            if m:
-                case_number = m.group(0).strip()
-                break
+        case_number = vals[case_number_index] if case_number_index is not None else ""
+        if not case_number:
+            for v in vals:
+                m = re.search(r"\b(?:WP|RFA|RP|CRL\.?P|W\.A|MFA|COMAP|CCC|CP|W\.P)\s*[A-Z0-9./-]*\d+[A-Z0-9./-]*\b", v, re.I)
+                if m:
+                    case_number = m.group(0).strip()
+                    break
         if not case_number:
             continue
 
         ctx = find_case_context(page_lines, case_number)
-        petitioner, respondent = extract_party_pair(row_text)
+        party_text = vals[party_index] if party_index is not None else row_text
+        petitioner, respondent = extract_party_pair(party_text)
         if not petitioner or not respondent:
             # Try a small page-text context around the first case occurrence.
             for line in page_lines:
@@ -378,11 +625,13 @@ def row_records(df: pd.DataFrame, page_lines: list[str], bench: str, query: str)
                     if petitioner and respondent:
                         break
         party_pair = f"{petitioner} V/s {respondent}" if petitioner and respondent else ""
+        item = vals[item_index] if item_index is not None else ctx.get("list_no", "")
+        session = vals[session_index] if session_index is not None else ctx.get("session", "")
         rec = {
-            "Court Hall & Bench (Name of Judges)": f"{bench} | Court Hall {ctx.get('court_hall','')} | {ctx.get('judges','')}".strip(" |"),
-            "Item / Serial Number & Session Type": f"List {ctx.get('list_no','')}; {ctx.get('session','')}; Date search seed: {query}",
+            "Court Hall & Bench (Name of Judges)": f"{bench} | Court Hall {vals[1] if len(vals) > 1 else ''} | {ctx.get('judges','')}".strip(" |"),
+            "Item / Serial Number & Session Type": " - ".join(part for part in (item, session) if part) or f"Search date seed: {query}",
             "Case Number": case_number,
-            "Case Type": ctx.get("session", ""),
+            "Case Type": vals[case_type_index] if case_type_index is not None else "",
             "Petitioner V/s Respondent": party_pair,
             "Advocate Name & Variant Matched": f"{variant} (matched to {group}, score {score})",
             "Bench": bench,
@@ -390,6 +639,71 @@ def row_records(df: pd.DataFrame, page_lines: list[str], bench: str, query: str)
         }
         (confirmed if score >= FUZZY_CONFIRM else uncertain).append(rec)
     return confirmed, uncertain
+
+
+def enrich_case_details(page, html: str, records: list[dict]) -> None:
+    """Fill required party, classification, and judge fields from Court case links."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "lxml")
+    details = {}
+    for link in soup.select("#listDisp a[href*='causelistcasestatus']"):
+        case_number = clean_advocate_text(link.get_text(" ", strip=True))
+        match = re.search(r'causelistcasestatus\("([^"]+)', link.get("href", ""))
+        if not case_number or not match:
+            continue
+        response = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = page.request.get(
+                    f"{BASE_URL.rsplit('/', 1)[0]}/casestatushck.php?params={match.group(1)}",
+                    timeout=60000,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    page.wait_for_timeout(1000 * (attempt + 1))
+        if response is None:
+            raise RuntimeError(f"Case-status request failed after 3 attempts: {last_error}")
+        if response.status >= 400:
+            raise RuntimeError(f"Case-status request returned HTTP {response.status}")
+        case_soup = BeautifulSoup(response.text(), "lxml")
+        def value(element_id: str) -> str:
+            node = case_soup.select_one(f"#{element_id}")
+            return clean_advocate_text(node.get_text(" ", strip=True)) if node else ""
+        details[case_number] = {
+            "petitioner": value("petitioner"),
+            "respondent": value("respondent"),
+            "case_type": value("classification"),
+            "judge": value("judge"),
+        }
+    for record in records:
+        detail = details.get(record.get("Case Number", ""), {})
+        if detail.get("petitioner") and detail.get("respondent"):
+            record["Petitioner V/s Respondent"] = f"{detail['petitioner']} V/s {detail['respondent']}"
+        record["Case Type"] = detail.get("case_type", record.get("Case Type", ""))
+        if detail.get("judge"):
+            record["Court Hall & Bench (Name of Judges)"] += f" | {detail['judge']}"
+
+
+def apply_list_metadata(records: list[dict], metadata: dict[str, dict[str, str]]) -> None:
+    for record in records:
+        detail = metadata.get(record.get("Case Number", ""))
+        if not detail:
+            continue
+        session = detail.get("session", "")
+        serial = detail.get("serial", "")
+        if serial and session:
+            record["Item / Serial Number & Session Type"] = f"Item {serial} - {session}"
+        elif serial:
+            record["Item / Serial Number & Session Type"] = f"Item {serial}"
+        if detail.get("hall"):
+            record["Court Hall & Bench (Name of Judges)"] = (
+                f"{record['Bench']} | Court Hall {detail['hall']}"
+                + (f" | {detail['judge']}" if detail.get("judge") else "")
+            )
 
 
 def dedupe(records: list[dict]) -> list[dict]:
@@ -447,7 +761,47 @@ def save_results(records: list[dict], uncertain: list[dict], tentative: list[dic
     (RESULTS / "bench_status.md").write_text("\n".join(status_lines) + "\n", encoding="utf-8")
 
 
+def run_local_test() -> int:
+    """Exercise output routing and table parsing without a browser or network."""
+    fixture = ROOT / "fixtures" / "local_result.html"
+    html = fixture.read_text(encoding="utf-8")
+    lines = html_text(html).splitlines()
+    statuses = {
+        "Bengaluru Bench": {"status": "FINAL", "updated_at": "18-09-2026 @ 07:10 PM", "source_text": "18-09-2026 @ 07:10 PM"},
+        "Dharwad Bench": {"status": "TENTATIVE", "updated_at": "", "source_text": "Final Cause List Pending"},
+        "Kalaburagi Bench": {"status": "FINAL", "updated_at": "18-09-2026 @ 07:16 PM", "source_text": "18-09-2026 @ 07:16 PM"},
+    }
+    confirmed, uncertain, tentative = [], [], []
+    for bench in BENCHES:
+        found, review = [], []
+        for table in tables_from_html(html):
+            current, manual = row_records(table, lines, bench, "local-test")
+            found.extend(current)
+            review.extend(manual)
+        if statuses[bench]["status"] == "TENTATIVE":
+            tentative.extend(found + review)
+        else:
+            confirmed.extend(found)
+            uncertain.extend(review)
+    save_results(confirmed, uncertain, tentative, statuses)
+    summary = {
+        "run_date": str(date.today()),
+        "search_end_date": str(date.today()),
+        "confirmed_count": len(dedupe(confirmed)),
+        "uncertain_count": len(dedupe(uncertain)),
+        "tentative_count": len(dedupe(tentative)),
+        "bench_status": statuses,
+        "errors": [],
+        "mode": "local-test",
+    }
+    (RESULTS / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def main():
+    if "--local-test" in sys.argv:
+        return run_local_test()
     start = date.today()
     end = start + timedelta(days=max(0, DAYS_AHEAD - 1))
     confirmed_all: list[dict] = []
@@ -474,7 +828,7 @@ def main():
 
             for query in QUERY_SEEDS:
                 try:
-                    html = run_advocate_search(page, bench, query, start, end)
+                    html = run_search_with_retries(run_advocate_search, page, bench, query, start, end)
                     text = html_text(html)
                     lines = text.splitlines()
                     tables = tables_from_html(html)
@@ -483,11 +837,16 @@ def main():
                         c, u = row_records(table, lines, bench, query)
                         page_conf.extend(c)
                         page_unc.extend(u)
+                    enrich_case_details(page, html, page_conf + page_unc)
+                    general_html = run_search_with_retries(run_general_advocate_search, page, bench, query, start, end)
+                    apply_list_metadata(page_conf + page_unc, general_list_metadata(general_html))
                     # Fallback to raw page text if no tables are available.
-                    if not tables and text:
-                        bm = match_advocate(text)
-                        if bm[1] >= FUZZY_UNCERTAIN:
-                            errors.append(f"{bench} / {query}: no result tables; possible page-text-only match, inspect run logs")
+                    if not tables:
+                        result_text = norm(text)
+                        if not result_text:
+                            errors.append(f"{bench} / {query}: #listDisp is empty")
+                        elif "no records found" not in result_text and "advocate name should not be more than 2 words" not in result_text:
+                            errors.append(f"{bench} / {query}: unexpected #listDisp HTML without result table")
                     if statuses.get(bench, {}).get("status") == "TENTATIVE":
                         tentative_all.extend(page_conf)
                         tentative_all.extend(page_unc)
@@ -510,8 +869,8 @@ def main():
     }
     (RESULTS / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
-    # Don't fail the workflow just because one bench/query was unavailable; do fail on total inability.
-    if not confirmed_all and not uncertain_all and not tentative_all and len(errors) >= len(BENCHES) * len(QUERY_SEEDS):
+    # Partial results are unsafe to publish because a failed bench can look like no match.
+    if errors or any(status.get("status") == "UNKNOWN" for status in statuses.values()):
         return 2
     return 0
 

@@ -1,0 +1,26 @@
+{
+  "run_date": "2026-09-24",
+  "search_end_date": "2026-09-24",
+  "confirmed_count": 2,
+  "uncertain_count": 0,
+  "tentative_count": 1,
+  "bench_status": {
+    "Bengaluru Bench": {
+      "status": "FINAL",
+      "updated_at": "18-09-2026 @ 07:10 PM",
+      "source_text": "18-09-2026 @ 07:10 PM"
+    },
+    "Dharwad Bench": {
+      "status": "TENTATIVE",
+      "updated_at": "",
+      "source_text": "Final Cause List Pending"
+    },
+    "Kalaburagi Bench": {
+      "status": "FINAL",
+      "updated_at": "18-09-2026 @ 07:16 PM",
+      "source_text": "18-09-2026 @ 07:16 PM"
+    }
+  },
+  "errors": [],
+  "mode": "local-test"
+}
